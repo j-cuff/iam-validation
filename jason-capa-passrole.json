@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CAPAPassRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:ListAttachedRolePolicies"
+      ],
+      "Resource": [
+        "arn:aws-us-gov:iam::<aws-account-id>:role/*.cluster-api-provider-aws.sigs.k8s.io"
+      ]
+    }
+  ]
+}
