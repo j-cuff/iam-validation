@@ -9,7 +9,8 @@
         "eks:CreatePodIdentityAssociation",
         "eks:DeletePodIdentityAssociation",
         "eks:DescribeAddonVersions",
-        "eks:CreateAddon"
+        "eks:CreateAddon",
+        "eks:UpdateAddon"
       ],
       "Resource": "*"
     },

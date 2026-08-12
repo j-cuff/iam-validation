@@ -10,7 +10,7 @@
         "iam:ListAttachedRolePolicies"
       ],
       "Resource": [
-        "arn:aws-us-gov:iam::<aws-account-id>:role/*.cluster-api-provider-aws.sigs.k8s.io"
+        "${CAPA_ROLE_PATTERN}"
       ]
     }
   ]

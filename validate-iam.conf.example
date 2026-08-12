@@ -1,0 +1,31 @@
+# AWS CLI profile and partition used for validation.
+AWS_PROFILE="your-profile"
+PARTITION="aws"
+
+# Authentication method: secret, sts, or pod-identity.
+# In secret mode, this profile must use the same IAM user access key that
+# Palette stores; profiles that assume a role are rejected.
+AUTH_MODE="pod-identity"
+
+# EKS management cluster. Leave empty to skip live cluster checks.
+CLUSTER_NAME="your-eks-cluster"
+
+# Leave empty to resolve the account ID from the active AWS credentials.
+ACCOUNT_ID=""
+
+# Palette VerteX IAM role names (used by sts and/or pod-identity modes).
+: "${ROLE_ID_SUFFIX=}" # Shared identifier used by the derived Palette role names
+: "${DEPLOYER_ROLE_NAME=SpectroCloudPaletteRole${ROLE_ID_SUFFIX:+-${ROLE_ID_SUFFIX}}}"
+: "${HUBBLE_ROLE_NAME=SpectroCloudHubbleRole${ROLE_ID_SUFFIX:+-${ROLE_ID_SUFFIX}}}"
+: "${IDENTITY_ROLE_NAME=SpectroCloudIdentityRole${ROLE_ID_SUFFIX:+-${ROLE_ID_SUFFIX}}}"
+
+# IAM policy profile created for the Palette role.
+# Valid values: core, minimum-dynamic, minimum-static.
+PERMISSION_PROFILE="minimum-dynamic"
+
+# EKS placement mode: dynamic or static. For minimum profiles, this must match
+# the suffix of PERMISSION_PROFILE.
+PLACEMENT_MODE="dynamic"
+
+# Optional target account for cross-account STS validation.
+TARGET_ACCOUNT_ID=""
