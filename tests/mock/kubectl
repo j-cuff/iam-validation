@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Offline stand-in for kubectl, used by tests/run_tests.py.
+
+Implements only the reads validate-iam.sh performs, from the "k8s" section of
+the JSON file named by MOCK_STATE.
+"""
+import json
+import os
+import sys
+
+
+def opt(args, *names):
+    for name in names:
+        if name in args:
+            return args[args.index(name) + 1]
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    k8s = json.load(open(os.environ["MOCK_STATE"])).get("k8s", {})
+    namespace = opt(args, "-n", "--namespace")
+
+    if args[:3] == ["get", "configmap", "palette-global-config"]:
+        value = k8s.get("managementClusterName")
+        if value is None:
+            print('Error from server (NotFound): configmaps "palette-global-config" not found', file=sys.stderr)
+            sys.exit(1)
+        print(value, end="")
+        return
+
+    pod = k8s.get("pods", {}).get(namespace)
+    if args[:2] == ["get", "pods"]:
+        print(pod["name"] if pod else "", end="")
+        return
+    if args[:2] == ["get", "pod"]:
+        print(" ".join(pod["env"]) if pod else "", end="")
+        return
+
+    print(f"mock kubectl: unsupported call: {' '.join(args)}", file=sys.stderr)
+    sys.exit(99)
+
+
+if __name__ == "__main__":
+    main()

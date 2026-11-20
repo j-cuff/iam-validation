@@ -5,6 +5,8 @@ PARTITION="aws"
 # Authentication method: secret, sts, or pod-identity.
 # In secret mode, this profile must use the same IAM user access key that
 # Palette stores; profiles that assume a role are rejected.
+# In sts mode, this profile must use credentials for the AWS account that is
+# configured for STS on your Palette/VerteX instance.
 AUTH_MODE="pod-identity"
 
 # EKS management cluster. Leave empty to skip live cluster checks.
@@ -27,5 +29,22 @@ PERMISSION_PROFILE="minimum-dynamic"
 # the suffix of PERMISSION_PROFILE.
 PLACEMENT_MODE="dynamic"
 
-# Optional target account for cross-account STS validation.
+# STS mode only. The External ID shown in the Palette "Add AWS Account" wizard.
+# The Spectro Cloud docs require it in the role trust policy.
+STS_EXTERNAL_ID=""
+# STS mode only. Set to "true" to also request session tags, which requires
+# sts:TagSession in the role trust policy. Palette's documented STS setup does
+# not grant it, so the default is "false".
+STS_SESSION_TAGS="false"
+
+# Optional target account for cross-account validation.
 TARGET_ACCOUNT_ID=""
+# Role names in the target account. The docs' cross-account examples are
+# SpectroCloudPaletteTargetRole and SpectroCloudHubbleTargetRole. When empty,
+# the local DEPLOYER_ROLE_NAME and HUBBLE_ROLE_NAME are used.
+TARGET_DEPLOYER_ROLE_NAME=""
+TARGET_HUBBLE_ROLE_NAME=""
+# Pod Identity cross-account only. An AWS CLI profile for the target account,
+# used to simulate the target roles' permissions and read their trust policies.
+# Leave empty to skip the target-account side.
+TARGET_AWS_PROFILE=""

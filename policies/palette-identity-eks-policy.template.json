@@ -21,17 +21,13 @@
       "Sid": "IAM",
       "Effect": "Allow",
       "Action": ["iam:GetRole"],
-      "Resource": [
-        "arn:aws-us-gov:iam::<aws-account-id>:role/DeployerV2"
-      ]
+      "Resource": ["${PALETTE_ROLE_ARN}"]
     },
     {
       "Sid": "IAMPassRoleforPodIdentity",
       "Effect": "Allow",
       "Action": ["iam:PassRole"],
-      "Resource": [
-        "arn:aws-us-gov:iam::<aws-account-id>:role/DeployerV2"
-      ]
+      "Resource": ["${PALETTE_ROLE_ARN}"]
     }
   ]
 }

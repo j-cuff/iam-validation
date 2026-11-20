@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Offline stand-in for the AWS CLI, used by tests/run_tests.py.
+
+Reads the fake AWS environment from the JSON file named by MOCK_STATE and
+evaluates IAM policy simulations against the real policy documents stored
+there. Only the calls and --query expressions that validate-iam.sh uses are
+implemented. Every call is appended to MOCK_LOG as one JSON line.
+"""
+import json
+import os
+import re
+import sys
+
+
+def die(message, code=254):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def opt(args, name, many=False):
+    if name not in args:
+        return [] if many else None
+    i = args.index(name) + 1
+    if not many:
+        return args[i]
+    values = []
+    while i < len(args) and not args[i].startswith("--"):
+        values.append(args[i])
+        i += 1
+    return values
+
+
+def glob(pattern, value, ignore_case=False):
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return re.match(regex, value, re.I if ignore_case else 0) is not None
+
+
+def as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def evaluate(policies, action, resource):
+    decision = "implicitDeny"
+    for policy in policies:
+        for st in as_list(policy.get("Statement")):
+            if st.get("Condition"):
+                continue  # conditions are not modelled; treat as non-matching
+            if "Action" in st:
+                action_ok = any(glob(p, action, True) for p in as_list(st["Action"]))
+            else:
+                action_ok = not any(glob(p, action, True) for p in as_list(st.get("NotAction")))
+            if "Resource" in st:
+                resource_ok = any(glob(p, resource) for p in as_list(st["Resource"]))
+            else:
+                resource_ok = "NotResource" in st and not any(glob(p, resource) for p in as_list(st["NotResource"]))
+            if action_ok and resource_ok:
+                if st.get("Effect") == "Deny":
+                    return "explicitDeny"
+                decision = "allowed"
+    return decision
+
+
+def out(value, args):
+    if opt(args, "--output") == "text":
+        print("None" if value is None else value)
+    else:
+        print(json.dumps(value, indent=2))
+
+
+def main():
+    args = sys.argv[1:]
+    state = json.load(open(os.environ["MOCK_STATE"]))
+    if os.environ.get("MOCK_LOG"):
+        with open(os.environ["MOCK_LOG"], "a") as log:
+            log.write(json.dumps({"profile": os.environ.get("AWS_PROFILE"), "args": args}) + "\n")
+
+    if args[:1] == ["--version"]:
+        print("aws-cli/2.99.0 Python/3 mock")
+        return
+
+    profile_name = opt(args, "--profile") or os.environ.get("AWS_PROFILE", "default")
+    profile = state["profiles"].get(profile_name)
+    if profile is None:
+        die(f"The config profile ({profile_name}) could not be found", 255)
+    account = profile["account"]
+    partition = state.get("partition", "aws")
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or profile.get("region")
+    query = opt(args, "--query")
+    service, command = (args + ["", ""])[:2]
+
+    if (service, command) == ("configure", "get"):
+        if args[2:3] == ["region"] and profile.get("region"):
+            print(profile["region"])
+            return
+        sys.exit(1)
+
+    if (service, command) == ("sts", "get-caller-identity"):
+        ident = {"UserId": "AIDAMOCK", "Account": account, "Arn": profile["arn"]}
+        out(ident.get(query, ident) if query in ("Account", "Arn") else ident, args)
+        return
+
+    if (service, command) == ("sts", "assume-role"):
+        role_arn = opt(args, "--role-arn")
+        rule = state.get("assume", {}).get(role_arn)
+        if rule is None or account not in rule.get("trusted_accounts", []):
+            die(f"An error occurred (AccessDenied) when calling the AssumeRole operation: User: {profile['arn']} is not authorized to perform: sts:AssumeRole on resource: {role_arn}")
+        if rule.get("external_id") and opt(args, "--external-id") != rule["external_id"]:
+            die(f"An error occurred (AccessDenied) when calling the AssumeRole operation: User: {profile['arn']} is not authorized to perform: sts:AssumeRole on resource: {role_arn}")
+        if "--tags" in args and not rule.get("allow_tags"):
+            die(f"An error occurred (AccessDenied) when calling the AssumeRole operation: User: {profile['arn']} is not authorized to perform: sts:TagSession on resource: {role_arn}")
+        out("ASIAMOCKSESSION0001" if query == "Credentials.AccessKeyId" else {}, args)
+        return
+
+    if (service, command) == ("iam", "get-role"):
+        arn = f"arn:{partition}:iam::{account}:role/{opt(args, '--role-name')}"
+        role = state["principals"].get(arn)
+        if role is None or "trust" not in role:
+            die(f"An error occurred (NoSuchEntity) when calling the GetRole operation: The role with name {opt(args, '--role-name')} cannot be found.")
+        doc = {"Role": {"Arn": arn, "AssumeRolePolicyDocument": role["trust"]}}
+        if query == "Role.Arn":
+            out(arn, args)
+        elif query == "Role.AssumeRolePolicyDocument":
+            out(role["trust"], args)
+        else:
+            out(doc, args)
+        return
+
+    if (service, command) == ("iam", "simulate-principal-policy"):
+        principal = opt(args, "--policy-source-arn")
+        if f"::{account}:" not in principal:
+            die("An error occurred (InvalidInput) when calling the SimulatePrincipalPolicy operation: Invalid Entity Arn (mock: principal is not in the caller's account)")
+        entity = state["principals"].get(principal)
+        if entity is None:
+            die(f"An error occurred (NoSuchEntity) when calling the SimulatePrincipalPolicy operation: {principal} not found")
+        resources = opt(args, "--resource-arns", many=True) or ["*"]
+        results = [
+            {"EvalActionName": a, "EvalResourceName": r, "EvalDecision": evaluate(entity.get("policies", []), a, r)}
+            for a in opt(args, "--action-names", many=True) for r in resources
+        ]
+        if query == "EvaluationResults[0].EvalDecision":
+            out(results[0]["EvalDecision"], args)
+        elif query == "EvaluationResults[].{Action:EvalActionName,Decision:EvalDecision}":
+            out([{"Action": r["EvalActionName"], "Decision": r["EvalDecision"]} for r in results], args)
+        else:
+            out({"EvaluationResults": results}, args)
+        return
+
+    if (service, command) == ("iam", "get-open-id-connect-provider"):
+        if opt(args, "--open-id-connect-provider-arn") in state.get("oidc_providers", []):
+            out({}, args)
+            return
+        die("An error occurred (NoSuchEntity) when calling the GetOpenIDConnectProvider operation: OpenIDConnect Provider not found")
+
+    if service == "eks":
+        if not region:
+            die("You must specify a region. You can also configure your region by running \"aws configure\".", 253)
+        cluster = state.get("cluster") or {}
+        name = opt(args, "--name") or opt(args, "--cluster-name")
+        if name != cluster.get("name"):
+            die(f"An error occurred (ResourceNotFoundException): No cluster found for name: {name}.")
+        if command == "describe-cluster":
+            values = {"cluster.status": cluster.get("status", "ACTIVE"), "cluster.version": cluster.get("version", "1.31"),
+                      "cluster.identity.oidc.issuer": cluster.get("issuer")}
+            out(values[query], args)
+            return
+        if command == "describe-addon":
+            status = cluster.get("addons", {}).get(opt(args, "--addon-name"))
+            if status is None:
+                die("An error occurred (ResourceNotFoundException) when calling the DescribeAddon operation: No addon found")
+            out(status, args)
+            return
+        if command == "list-pod-identity-associations":
+            out(cluster.get("associations", []), args)
+            return
+
+    die(f"mock aws: unsupported call: {' '.join(args)}", 99)
+
+
+if __name__ == "__main__":
+    main()

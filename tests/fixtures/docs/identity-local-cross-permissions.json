@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EKSPodIdentityManagement",
+      "Effect": "Allow",
+      "Action": [
+        "eks:ListPodIdentityAssociations",
+        "eks:CreatePodIdentityAssociation",
+        "eks:DeletePodIdentityAssociation"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "EC2",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "IAM",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:PassRole",
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ],
+      "Resource": [
+        "arn:<partition>:iam::<target-aws-account-id>:role/<role-name-for-palette-iam-target-role>",
+        "arn:<partition>:iam::<aws-management-cluster-account-id>:role/<role-name-for-identity-service-iam-local-role>"
+      ]
+    }
+  ]
+}

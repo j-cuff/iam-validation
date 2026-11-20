@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:<partition>:iam::<aws-management-cluster-account-id>:role/spectro-hubble-identity"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "<aws-management-cluster-region>/<aws-management-cluster-account-id>/<management-cluster-name>/hubble-system/spectro-hubble"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:<partition>:iam::<aws-management-cluster-account-id>:role/spectro-hubble-identity"
+      },
+      "Action": "sts:TagSession"
+    }
+  ]
+}

@@ -13,7 +13,15 @@ fi
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+if [[ -z "${AWS_PROFILE:-}" ]]; then
+  echo "ERROR: AWS_PROFILE is not set in $CONFIG_FILE" >&2
+  exit 1
+fi
 export AWS_PROFILE
+
+PARTITION="${PARTITION:-aws}"
+ACCOUNT_ID="${ACCOUNT_ID:-}"
 
 case "$PARTITION" in
   aws)         ARN_PREFIX="arn:aws" ;;

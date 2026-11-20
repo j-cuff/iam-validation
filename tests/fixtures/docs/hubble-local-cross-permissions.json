@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": [
+        "iam:GetRole",
+        "iam:PassRole",
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:<partition>:iam::<target-aws-account-id>:role/<hubble-service-iam-target-role>"
+      ],
+      "Sid": "IAM"
+    }
+  ]
+}
