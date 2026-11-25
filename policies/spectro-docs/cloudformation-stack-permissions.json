@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationStackPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:UpdateStack",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:ListStackResources",
+        "cloudformation:GetTemplate",
+        "cloudformation:ContinueUpdateRollback",
+        "cloudformation:DeleteStack"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IAMCAPARolePermissions",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:AttachRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:GetPolicyVersion",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion",
+        "iam:GetPolicy",
+        "iam:ListPolicyVersions",
+        "iam:GetRole",
+        "iam:GetInstanceProfile",
+        "iam:DetachRolePolicy",
+        "iam:CreatePolicy",
+        "iam:TagPolicy",
+        "iam:CreateInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:DeletePolicy",
+        "iam:DeleteRole",
+        "iam:DeleteInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

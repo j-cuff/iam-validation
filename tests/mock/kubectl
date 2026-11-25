@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Offline stand-in for kubectl, used by tests/run_tests.py.
+
+Implements only the commands validate-iam.sh and setup-iam.sh run, against
+the "k8s" section of the JSON file named by MOCK_STATE.
+"""
+import json
+import os
+import sys
+
+
+def opt(args, *names):
+    for name in names:
+        if name in args:
+            return args[args.index(name) + 1]
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    path = os.environ["MOCK_STATE"]
+    state = json.load(open(path))
+    k8s = state.setdefault("k8s", {})
+    namespace = opt(args, "-n", "--namespace")
+
+    def save():
+        with open(path, "w") as f:
+            json.dump(state, f)
+
+    if args[:2] == ["config", "current-context"]:
+        print(k8s.get("context", "mock-context"))
+        return
+    if args[:2] == ["config", "view"]:
+        print(k8s.get("server", state.get("cluster", {}).get("endpoint", "")), end="")
+        return
+
+    if args[:3] == ["get", "configmap", "palette-global-config"]:
+        value = k8s.get("managementClusterName")
+        if value is None:
+            print('Error from server (NotFound): configmaps "palette-global-config" not found', file=sys.stderr)
+            sys.exit(1)
+        print(value, end="")
+        return
+    if args[:3] == ["create", "configmap", "palette-global-config"]:
+        if k8s.get("managementClusterName") is not None:
+            print('Error from server (AlreadyExists): configmaps "palette-global-config" already exists', file=sys.stderr)
+            sys.exit(1)
+        literal = next(a for a in args if a.startswith("--from-literal="))
+        k8s["managementClusterName"] = literal.split("=", 2)[2]
+        save()
+        return
+    if args[:3] == ["patch", "configmap", "palette-global-config"]:
+        k8s["managementClusterName"] = json.loads(opt(args, "-p"))["data"]["managementClusterName"]
+        save()
+        return
+
+    pod = k8s.get("pods", {}).get(namespace)
+    if args[:2] == ["get", "pods"]:
+        print(pod["name"] if pod else "", end="")
+        return
+    if args[:2] == ["get", "pod"]:
+        print(" ".join(pod["env"]) if pod else "", end="")
+        return
+
+    print(f"mock kubectl: unsupported call: {' '.join(args)}", file=sys.stderr)
+    sys.exit(99)
+
+
+if __name__ == "__main__":
+    main()

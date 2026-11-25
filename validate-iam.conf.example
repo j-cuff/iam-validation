@@ -1,4 +1,5 @@
-# AWS CLI profile and partition used for validation.
+# AWS CLI profile and partition. This is the account that holds the Palette
+# roles: validate-iam.sh inspects it and setup-iam.sh creates roles in it.
 AWS_PROFILE="your-profile"
 PARTITION="aws"
 
@@ -27,5 +28,42 @@ PERMISSION_PROFILE="minimum-dynamic"
 # the suffix of PERMISSION_PROFILE.
 PLACEMENT_MODE="dynamic"
 
-# Optional target account for cross-account STS validation.
+# STS mode only. The AWS account ID and External ID shown in the Palette
+# "Add AWS Account" wizard. The role trusts that account (the one configured
+# for STS on your Palette/VerteX instance) with that External ID.
+STS_TRUSTED_ACCOUNT_ID=""
+STS_EXTERNAL_ID=""
+# STS mode only, optional. A profile with credentials in STS_TRUSTED_ACCOUNT_ID,
+# used by validate-iam.sh for a live assume-role test. Without it, the
+# validator checks the trust policy only (unless AWS_PROFILE is that account).
+STS_CALLER_PROFILE=""
+# STS mode only. Set to "true" to also request session tags, which requires
+# sts:TagSession in the role trust policy. Palette's documented STS setup does
+# not grant it, so the default is "false".
+STS_SESSION_TAGS="false"
+
+# Optional target account for cross-account validation.
 TARGET_ACCOUNT_ID=""
+# Role names in the target account. The docs' cross-account examples are
+# SpectroCloudPaletteTargetRole and SpectroCloudHubbleTargetRole. When empty,
+# the local DEPLOYER_ROLE_NAME and HUBBLE_ROLE_NAME are used.
+TARGET_DEPLOYER_ROLE_NAME=""
+TARGET_HUBBLE_ROLE_NAME=""
+# An AWS CLI profile for the target account. setup-iam.sh creates the target
+# roles with it; validate-iam.sh uses it to check them. Leave empty to skip the
+# target-account side when validating.
+TARGET_AWS_PROFILE=""
+
+# ─── setup-iam.sh only ───────────────────────────────────────────────────────
+# How the CAPA roles are created: "palette" attaches the docs' CloudFormation
+# stack permissions so Palette creates them (Option 1; core policies already
+# include them), "manual" creates the stack now from the docs template
+# (Option 2), "none" does neither.
+CFN_STACK_MODE="palette"
+# Also install the eks-pod-identity-agent add-on and create the
+# kube-system/palette-global-config ConfigMap (uses the current kubectl context,
+# which must point at CLUSTER_NAME).
+SETUP_CLUSTER_PREREQS="false"
+# Suffix for the managed policy names, so several environments can share an
+# account. Defaults to ROLE_ID_SUFFIX.
+POLICY_NAME_SUFFIX="${ROLE_ID_SUFFIX:-}"

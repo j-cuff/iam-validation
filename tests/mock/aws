@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Offline stand-in for the AWS CLI, used by tests/run_tests.py.
+
+Reads the fake AWS environment from the JSON file named by MOCK_STATE and
+writes changes back to it. IAM policy simulation evaluates the real policy
+documents stored there (inline, attached managed, and fixture policies), and
+sts:AssumeRole evaluates the role's trust policy. Only the calls and --query
+expressions that validate-iam.sh and setup-iam.sh use are implemented. Every
+call is appended to MOCK_LOG as one JSON line.
+"""
+import json
+import os
+import re
+import sys
+
+STATE_PATH = os.environ.get("MOCK_STATE", "")
+
+
+def die(message, code=254):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def opt(args, name, many=False):
+    if name not in args:
+        return [] if many else None
+    i = args.index(name) + 1
+    if not many:
+        return args[i]
+    values = []
+    while i < len(args) and not args[i].startswith("--"):
+        values.append(args[i])
+        i += 1
+    return values
+
+
+def document(value):
+    if value.startswith("file://"):
+        value = open(value[len("file://"):]).read()
+    return json.loads(value)
+
+
+def glob(pattern, value, ignore_case=False):
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return re.match(regex, value, re.I if ignore_case else 0) is not None
+
+
+def as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def evaluate(policies, action, resource):
+    decision = "implicitDeny"
+    for policy in policies:
+        for st in as_list(policy.get("Statement")):
+            if st.get("Condition"):
+                continue  # conditions are not modelled; treat as non-matching
+            if "Action" in st:
+                action_ok = any(glob(p, action, True) for p in as_list(st["Action"]))
+            else:
+                action_ok = not any(glob(p, action, True) for p in as_list(st.get("NotAction")))
+            if "Resource" in st:
+                resource_ok = any(glob(p, resource) for p in as_list(st["Resource"]))
+            else:
+                resource_ok = "NotResource" in st and not any(glob(p, resource) for p in as_list(st["NotResource"]))
+            if action_ok and resource_ok:
+                if st.get("Effect") == "Deny":
+                    return "explicitDeny"
+                decision = "allowed"
+    return decision
+
+
+def out(value, args):
+    if opt(args, "--output") == "text":
+        if isinstance(value, list):
+            print("\t".join("None" if v is None else str(v) for v in value))
+        else:
+            print("None" if value is None else value)
+    else:
+        print(json.dumps(value, indent=2))
+
+
+class Mock:
+    def __init__(self, args):
+        self.args = args
+        self.state = json.load(open(STATE_PATH))
+        self.state.setdefault("principals", {})
+        self.state.setdefault("managed_policies", {})
+        self.state.setdefault("stacks", {})
+        name = opt(args, "--profile") or os.environ.get("AWS_PROFILE", "default")
+        self.profile = self.state["profiles"].get(name)
+        if self.profile is None:
+            die(f"The config profile ({name}) could not be found", 255)
+        self.account = self.profile["account"]
+        self.partition = self.state.get("partition", "aws")
+        self.region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or self.profile.get("region")
+        self.query = opt(args, "--query")
+
+    def save(self):
+        with open(STATE_PATH, "w") as f:
+            json.dump(self.state, f)
+
+    def role_arn(self, name):
+        return f"arn:{self.partition}:iam::{self.account}:role/{name}"
+
+    def role(self, name):
+        role = self.state["principals"].get(self.role_arn(name))
+        if role is None or "trust" not in role:
+            die(f"An error occurred (NoSuchEntity) when calling the operation: The role with name {name} cannot be found.")
+        return role
+
+    def policy(self, arn):
+        pol = self.state["managed_policies"].get(arn)
+        if pol is None:
+            die(f"An error occurred (NoSuchEntity) when calling the operation: Policy {arn} does not exist or is not attachable.")
+        return pol
+
+    def effective_policies(self, entity):
+        docs = list(entity.get("policies", []))
+        docs += list(entity.get("inline", {}).values())
+        for arn in entity.get("attached", []):
+            pol = self.state["managed_policies"][arn]
+            docs.append(next(v["doc"] for v in pol["versions"] if v["id"] == pol["default"]))
+        return docs
+
+    def emit(self, value):
+        out(value, self.args)
+
+
+def trust_allows(trust, caller_arn, caller_account, partition, action, external_id):
+    root = f"arn:{partition}:iam::{caller_account}:root"
+    for st in as_list(trust.get("Statement")):
+        if st.get("Effect") != "Allow" or not isinstance(st.get("Principal"), dict):
+            continue
+        principals = as_list(st["Principal"].get("AWS"))
+        if not any(p in (root, caller_arn, caller_account) for p in principals):
+            continue
+        if not any(glob(a, action, True) for a in as_list(st.get("Action"))):
+            continue
+        cond = st.get("Condition") or {}
+        wanted = as_list((cond.get("StringEquals") or {}).get("sts:ExternalId"))
+        if wanted and external_id not in wanted:
+            continue
+        return True
+    return False
+
+
+def main():
+    args = sys.argv[1:]
+    if os.environ.get("MOCK_LOG"):
+        with open(os.environ["MOCK_LOG"], "a") as log:
+            log.write(json.dumps({"profile": os.environ.get("AWS_PROFILE"), "args": args}) + "\n")
+    if args[:1] == ["--version"]:
+        print("aws-cli/2.99.0 Python/3 mock")
+        return
+
+    m = Mock(args)
+    service, command = (args + ["", ""])[:2]
+    call = (service, command)
+    q = m.query
+
+    # ── configure / sts ──
+    if call == ("configure", "get"):
+        if args[2:3] == ["region"] and m.profile.get("region"):
+            print(m.profile["region"])
+            return
+        sys.exit(1)
+
+    if call == ("sts", "get-caller-identity"):
+        ident = {"UserId": "AIDAMOCK", "Account": m.account, "Arn": m.profile["arn"]}
+        return m.emit(ident[q] if q in ("Account", "Arn") else ident)
+
+    if call == ("sts", "assume-role"):
+        role_arn = opt(args, "--role-arn")
+        role = m.state["principals"].get(role_arn)
+        denied = f"An error occurred (AccessDenied) when calling the AssumeRole operation: User: {m.profile['arn']} is not authorized to perform: %s on resource: {role_arn}"
+        if role is None or "trust" not in role:
+            die(denied % "sts:AssumeRole")
+        if not trust_allows(role["trust"], m.profile["arn"], m.account, m.partition, "sts:AssumeRole", opt(args, "--external-id")):
+            die(denied % "sts:AssumeRole")
+        if "--tags" in args and not trust_allows(role["trust"], m.profile["arn"], m.account, m.partition, "sts:TagSession", opt(args, "--external-id")):
+            die(denied % "sts:TagSession")
+        return m.emit("ASIAMOCKSESSION0001" if q == "Credentials.AccessKeyId" else {})
+
+    # ── IAM roles ──
+    if call == ("iam", "get-role"):
+        name = opt(args, "--role-name")
+        role = m.role(name)
+        if q == "Role.Arn":
+            return m.emit(m.role_arn(name))
+        if q == "Role.AssumeRolePolicyDocument":
+            return m.emit(role["trust"])
+        return m.emit({"Role": {"Arn": m.role_arn(name), "AssumeRolePolicyDocument": role["trust"]}})
+
+    if call == ("iam", "create-role"):
+        name = opt(args, "--role-name")
+        if m.role_arn(name) in m.state["principals"]:
+            die(f"An error occurred (EntityAlreadyExists) when calling the CreateRole operation: Role with name {name} already exists.")
+        m.state["principals"][m.role_arn(name)] = {
+            "trust": document(opt(args, "--assume-role-policy-document")), "policies": [], "inline": {}, "attached": [],
+            "tags": opt(args, "--tags", many=True)}
+        m.save()
+        return m.emit({"Role": {"Arn": m.role_arn(name)}})
+
+    if call == ("iam", "update-assume-role-policy"):
+        m.role(opt(args, "--role-name"))["trust"] = document(opt(args, "--policy-document"))
+        return m.save()
+
+    if call == ("iam", "put-role-policy"):
+        m.role(opt(args, "--role-name")).setdefault("inline", {})[opt(args, "--policy-name")] = document(opt(args, "--policy-document"))
+        return m.save()
+
+    if call == ("iam", "get-role-policy"):
+        inline = m.role(opt(args, "--role-name")).get("inline", {})
+        name = opt(args, "--policy-name")
+        if name not in inline:
+            die(f"An error occurred (NoSuchEntity) when calling the GetRolePolicy operation: The role policy with name {name} cannot be found.")
+        return m.emit(inline[name] if q == "PolicyDocument" else {"PolicyDocument": inline[name]})
+
+    if call == ("iam", "attach-role-policy"):
+        role = m.role(opt(args, "--role-name"))
+        arn = opt(args, "--policy-arn")
+        m.policy(arn)
+        if arn not in role.setdefault("attached", []):
+            role["attached"].append(arn)
+        return m.save()
+
+    if call == ("iam", "list-attached-role-policies"):
+        attached = m.role(opt(args, "--role-name")).get("attached", [])
+        if q == "AttachedPolicies[].PolicyArn":
+            return m.emit(attached)
+        return m.emit({"AttachedPolicies": [{"PolicyArn": a} for a in attached]})
+
+    # ── IAM managed policies ──
+    if call == ("iam", "create-policy"):
+        name = opt(args, "--policy-name")
+        arn = f"arn:{m.partition}:iam::{m.account}:policy/{name}"
+        if arn in m.state["managed_policies"]:
+            die(f"An error occurred (EntityAlreadyExists) when calling the CreatePolicy operation: A policy called {name} already exists.")
+        tags = {}
+        for tag in opt(args, "--tags", many=True):
+            parts = dict(p.split("=", 1) for p in tag.split(","))
+            tags[parts["Key"]] = parts["Value"]
+        m.state["managed_policies"][arn] = {"versions": [{"id": "v1", "doc": document(opt(args, "--policy-document")), "created": 1}],
+                                            "default": "v1", "tags": tags, "next": 2}
+        m.save()
+        return m.emit({"Policy": {"Arn": arn}})
+
+    if call == ("iam", "get-policy"):
+        pol = m.policy(opt(args, "--policy-arn"))
+        return m.emit(pol["default"] if q == "Policy.DefaultVersionId" else {"Policy": {"DefaultVersionId": pol["default"]}})
+
+    if call == ("iam", "list-policy-tags"):
+        tags = [{"Key": k, "Value": v} for k, v in m.policy(opt(args, "--policy-arn")).get("tags", {}).items()]
+        return m.emit(tags if q == "Tags" else {"Tags": tags})
+
+    if call == ("iam", "get-policy-version"):
+        pol = m.policy(opt(args, "--policy-arn"))
+        version = next((v for v in pol["versions"] if v["id"] == opt(args, "--version-id")), None)
+        if version is None:
+            die("An error occurred (NoSuchEntity) when calling the GetPolicyVersion operation: version not found")
+        return m.emit(version["doc"] if q == "PolicyVersion.Document" else {"PolicyVersion": {"Document": version["doc"]}})
+
+    if call == ("iam", "list-policy-versions"):
+        pol = m.policy(opt(args, "--policy-arn"))
+        versions = [{"VersionId": v["id"], "IsDefaultVersion": v["id"] == pol["default"], "CreateDate": f"2026-01-01T00:00:{v['created']:02d}Z"}
+                    for v in pol["versions"]]
+        return m.emit(versions if q == "Versions" else {"Versions": versions})
+
+    if call == ("iam", "create-policy-version"):
+        pol = m.policy(opt(args, "--policy-arn"))
+        if len(pol["versions"]) >= 5:
+            die("An error occurred (LimitExceeded) when calling the CreatePolicyVersion operation: A managed policy can have up to 5 versions.")
+        vid = f"v{pol['next']}"
+        pol["versions"].append({"id": vid, "doc": document(opt(args, "--policy-document")), "created": pol["next"]})
+        pol["next"] += 1
+        if "--set-as-default" in args:
+            pol["default"] = vid
+        m.save()
+        return m.emit({"PolicyVersion": {"VersionId": vid}})
+
+    if call == ("iam", "delete-policy-version"):
+        pol = m.policy(opt(args, "--policy-arn"))
+        vid = opt(args, "--version-id")
+        if vid == pol["default"]:
+            die("An error occurred (DeleteConflict) when calling the DeletePolicyVersion operation: Cannot delete the default version.")
+        pol["versions"] = [v for v in pol["versions"] if v["id"] != vid]
+        return m.save()
+
+    # ── IAM simulation and OIDC ──
+    if call == ("iam", "simulate-principal-policy"):
+        principal = opt(args, "--policy-source-arn")
+        if f"::{m.account}:" not in principal:
+            die("An error occurred (InvalidInput) when calling the SimulatePrincipalPolicy operation: Invalid Entity Arn (mock: principal is not in the caller's account)")
+        entity = m.state["principals"].get(principal)
+        if entity is None:
+            die(f"An error occurred (NoSuchEntity) when calling the SimulatePrincipalPolicy operation: {principal} not found")
+        policies = m.effective_policies(entity)
+        resources = opt(args, "--resource-arns", many=True) or ["*"]
+        results = [{"EvalActionName": a, "EvalResourceName": r, "EvalDecision": evaluate(policies, a, r)}
+                   for a in opt(args, "--action-names", many=True) for r in resources]
+        if q == "EvaluationResults[0].EvalDecision":
+            return m.emit(results[0]["EvalDecision"])
+        if q == "EvaluationResults[].{Action:EvalActionName,Decision:EvalDecision}":
+            return m.emit([{"Action": r["EvalActionName"], "Decision": r["EvalDecision"]} for r in results])
+        return m.emit({"EvaluationResults": results})
+
+    if call == ("iam", "get-open-id-connect-provider"):
+        if opt(args, "--open-id-connect-provider-arn") in m.state.get("oidc_providers", []):
+            return m.emit({})
+        die("An error occurred (NoSuchEntity) when calling the GetOpenIDConnectProvider operation: OpenIDConnect Provider not found")
+
+    # ── CloudFormation ──
+    if service == "cloudformation":
+        if not m.region:
+            die("You must specify a region. You can also configure your region by running \"aws configure\".", 253)
+        stacks = m.state["stacks"].setdefault(m.account, {})
+        name = opt(args, "--stack-name")
+        if command == "describe-stacks":
+            if name not in stacks:
+                die(f"An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id {name} does not exist")
+            return m.emit(stacks[name] if q == "Stacks[0].StackStatus" else {"Stacks": [{"StackStatus": stacks[name]}]})
+        if command == "create-stack":
+            if "CAPABILITY_NAMED_IAM" not in opt(args, "--capabilities", many=True):
+                die("An error occurred (InsufficientCapabilitiesException) when calling the CreateStack operation: Requires capabilities : [CAPABILITY_NAMED_IAM]")
+            body = opt(args, "--template-body")
+            template = open(body[len("file://"):]).read() if body.startswith("file://") else body
+            if m.partition != "aws" and "arn:aws:" in template:
+                die(f"An error occurred (ValidationError): mock: template uses arn:aws: ARNs in partition {m.partition}")
+            for role_name in re.findall(r"RoleName:\s*(\S+)", template):
+                m.state["principals"].setdefault(m.role_arn(role_name), {"trust": {"Version": "2012-10-17", "Statement": []}, "policies": []})
+            stacks[name] = "CREATE_COMPLETE"
+            m.save()
+            return m.emit({"StackId": f"arn:{m.partition}:cloudformation:{m.region}:{m.account}:stack/{name}/mock"})
+        if command == "wait":
+            return
+
+    # ── EKS ──
+    if service == "eks":
+        if not m.region:
+            die("You must specify a region. You can also configure your region by running \"aws configure\".", 253)
+        cluster = m.state.get("cluster") or {}
+        name = opt(args, "--name") or opt(args, "--cluster-name")
+        if name != cluster.get("name"):
+            die(f"An error occurred (ResourceNotFoundException): No cluster found for name: {name}.")
+        assocs = cluster.setdefault("associations", [])
+        for i, a in enumerate(assocs):
+            a.setdefault("Id", f"a-mock{i:04d}")
+        if command == "describe-cluster":
+            values = {"cluster.status": cluster.get("status", "ACTIVE"), "cluster.version": cluster.get("version", "1.31"),
+                      "cluster.identity.oidc.issuer": cluster.get("issuer"), "cluster.endpoint": cluster.get("endpoint")}
+            return m.emit(values[q])
+        if command == "describe-addon":
+            status = cluster.get("addons", {}).get(opt(args, "--addon-name"))
+            if status is None:
+                die("An error occurred (ResourceNotFoundException) when calling the DescribeAddon operation: No addon: eks-pod-identity-agent found in cluster")
+            return m.emit(status)
+        if command == "create-addon":
+            cluster.setdefault("addons", {})[opt(args, "--addon-name")] = "ACTIVE"
+            m.save()
+            return m.emit({})
+        if command == "wait":
+            return
+        if command == "list-pod-identity-associations":
+            # Like the real API, the summaries omit roleArn.
+            ns, sa = opt(args, "--namespace"), opt(args, "--service-account")
+            found = [{"namespace": a["NS"], "serviceAccount": a["SA"], "associationId": a["Id"]} for a in assocs
+                     if (ns is None or a["NS"] == ns) and (sa is None or a["SA"] == sa)]
+            if q == "associations[0].associationId":
+                return m.emit(found[0]["associationId"] if found else None)
+            return m.emit({"associations": found})
+        if command in ("describe-pod-identity-association", "update-pod-identity-association"):
+            assoc = next((a for a in assocs if a["Id"] == opt(args, "--association-id")), None)
+            if assoc is None:
+                die("An error occurred (ResourceNotFoundException): association not found")
+            if command == "update-pod-identity-association":
+                if opt(args, "--role-arn"):
+                    assoc["Role"] = opt(args, "--role-arn")
+                if opt(args, "--target-role-arn") is not None:
+                    assoc["TargetRole"] = opt(args, "--target-role-arn") or None
+                m.save()
+                return m.emit({})
+            if q == "association.[roleArn,targetRoleArn]":
+                return m.emit([assoc["Role"], assoc.get("TargetRole")])
+            return m.emit({"association": {"roleArn": assoc["Role"], "targetRoleArn": assoc.get("TargetRole")}})
+        if command == "create-pod-identity-association":
+            ns, sa = opt(args, "--namespace"), opt(args, "--service-account")
+            if any(a["NS"] == ns and a["SA"] == sa for a in assocs):
+                die("An error occurred (ResourceInUseException): Association already exists")
+            role_arn = opt(args, "--role-arn")
+            if role_arn not in m.state["principals"]:
+                die(f"An error occurred (InvalidParameterException): Role {role_arn} does not exist")
+            assocs.append({"NS": ns, "SA": sa, "Role": role_arn, "TargetRole": opt(args, "--target-role-arn"),
+                           "Id": f"a-mock{len(assocs):04d}"})
+            m.save()
+            return m.emit({})
+
+    die(f"mock aws: unsupported call: {' '.join(args)}", 99)
+
+
+if __name__ == "__main__":
+    main()
