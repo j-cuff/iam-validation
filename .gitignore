@@ -1,2 +1,5 @@
 # Local environment configuration
 validate-iam.conf
+
+# Python bytecode
+__pycache__/

@@ -1,8 +1,9 @@
-# Spectro Cloud docs policy fixtures
+# Spectro Cloud docs policies
 
 Extracted on 2026-11-20 by `tests/sync_docs_fixtures.py` from
 [spectrocloud/librarium](https://github.com/spectrocloud/librarium) (`master`).
-Placeholders such as `<partition>` are kept as published and filled in by the tests.
+Placeholders such as `<partition>` are kept as published; setup-iam.sh and the tests fill them in.
+setup-iam.sh also rewrites hardcoded `arn:aws:` ARNs for other partitions.
 
 | Fixture | Source | Docs "Last Update" |
 | --- | --- | --- |
@@ -24,3 +25,4 @@ Placeholders such as `<partition>` are kept as published and filled in by the te
 | `hubble-target-trust.json` | `_partials/clusters/aws/eks-pod-identity/_eks-pod-identity-prerequisites.mdx (JSON block 12)` | not stated |
 | `hubble-target-permissions.json` | `_partials/clusters/aws/eks-pod-identity/_eks-pod-identity-prerequisites.mdx (JSON block 13)` | not stated |
 | `hubble-local-cross-permissions.json` | `_partials/clusters/aws/eks-pod-identity/_eks-pod-identity-prerequisites.mdx (JSON block 15)` | not stated |
+| `palette-cloudformation-input-template.yaml` | `_partials/permissions/_aws-palette-cloud-formation-input-template.mdx` | February 14, 2026 |

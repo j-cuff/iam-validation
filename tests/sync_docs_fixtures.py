@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Refresh tests/fixtures/docs from the Spectro Cloud documentation source.
+"""Refresh policies/spectro-docs from the Spectro Cloud documentation source.
 
-The fixtures are the IAM policies published in the Spectro Cloud docs
-(github.com/spectrocloud/librarium). tests/run_tests.py checks that a role with
-exactly these policies passes validate-iam.sh and that the script simulates
-every documented action. Re-run this after Spectro Cloud updates the docs, then
-run the tests: coverage failures show which checks validate-iam.sh is missing.
+These files are the IAM policies and CloudFormation template published in the
+Spectro Cloud docs (github.com/spectrocloud/librarium). setup-iam.sh applies
+them, and tests/run_tests.py checks that a role with exactly these policies
+passes validate-iam.sh and that the validator simulates every documented
+action. Re-run this after Spectro Cloud updates the docs, then run the tests:
+coverage failures show which checks validate-iam.sh is missing.
 
 Usage:
   tests/sync_docs_fixtures.py                     # fetch from GitHub (master)
@@ -17,11 +18,12 @@ import json
 import pathlib
 import re
 import sys
+import textwrap
 import urllib.request
 
 RAW = "https://raw.githubusercontent.com/spectrocloud/librarium/master/"
 HERE = pathlib.Path(__file__).resolve().parent
-OUT = HERE / "fixtures" / "docs"
+OUT = HERE.parent / "policies" / "spectro-docs"
 
 # Single-policy partials: fixture name -> partial path.
 PERMISSION_PARTIALS = {
@@ -53,6 +55,9 @@ POD_IDENTITY_BLOCKS = {
 }
 DUPLICATES = {3: 0, 5: 0, 7: 0, 10: 1, 11: 2, 14: 0}
 EXPECTED_BLOCKS = 16
+
+CFN_TEMPLATE_PARTIAL = "_partials/permissions/_aws-palette-cloud-formation-input-template.mdx"
+CFN_TEMPLATE_FILE = "palette-cloudformation-input-template.yaml"
 
 
 def read(source, rel):
@@ -123,23 +128,35 @@ def main():
         write(name, parsed[idx], changes)
         stamps.append((name, f"{POD_IDENTITY_PARTIAL} (JSON block {idx})", "not stated"))
 
+    text = read(source, CFN_TEMPLATE_PARTIAL)
+    yaml_blocks = [m.group(1) for m in re.finditer(r"```ya?ml[^\n]*\n(.*?)```", text, re.S)]
+    if len(yaml_blocks) != 1:
+        sys.exit(f"ERROR: expected one YAML block in {CFN_TEMPLATE_PARTIAL}, found {len(yaml_blocks)}")
+    template = textwrap.dedent(yaml_blocks[0]).rstrip() + "\n"
+    path = OUT / CFN_TEMPLATE_FILE
+    if not path.exists() or path.read_text() != template:
+        changes.append((CFN_TEMPLATE_FILE, [], [], not path.exists()))
+    path.write_text(template)
+    stamps.append((CFN_TEMPLATE_FILE.rsplit(".", 1)[0], CFN_TEMPLATE_PARTIAL, last_update(text)))
+
     today = datetime.date.today().isoformat()
     lines = [
-        "# Spectro Cloud docs policy fixtures",
+        "# Spectro Cloud docs policies",
         "",
         f"Extracted on {today} by `tests/sync_docs_fixtures.py` from",
         "[spectrocloud/librarium](https://github.com/spectrocloud/librarium) (`master`).",
-        "Placeholders such as `<partition>` are kept as published and filled in by the tests.",
+        "Placeholders such as `<partition>` are kept as published; setup-iam.sh and the tests fill them in.",
+        "setup-iam.sh also rewrites hardcoded `arn:aws:` ARNs for other partitions.",
         "",
         "| Fixture | Source | Docs \"Last Update\" |",
         "| --- | --- | --- |",
-    ] + [f"| `{n}.json` | `{r}` | {u} |" for n, r, u in stamps]
+    ] + [f"| `{n}{'.yaml' if n == CFN_TEMPLATE_FILE.rsplit('.', 1)[0] else '.json'}` | `{r}` | {u} |" for n, r, u in stamps]
     (OUT / "SOURCE.md").write_text("\n".join(lines) + "\n")
 
     if not changes:
         print("Fixtures already match the docs.")
     for name, added, removed, new in changes:
-        print(f"{'NEW' if new else 'CHANGED'}: {name}.json")
+        print(f"{'NEW' if new else 'CHANGED'}: {name if '.' in name else name + '.json'}")
         for a in added if not new else []:
             print(f"    + {a}")
         for a in removed:

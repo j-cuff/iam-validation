@@ -7,7 +7,7 @@
 # commercial (aws), GovCloud (aws-us-gov), and isolated partitions.
 #
 # The IAM checks follow these Spectro Cloud documentation pages (see
-# DOCS_SYNC_DATE and tests/fixtures/docs/SOURCE.md):
+# DOCS_SYNC_DATE and policies/spectro-docs/SOURCE.md):
 #   - Minimum EKS Dynamic permissions   (docs "Last Update": November 3, 2026)
 #   - Minimum EKS Static permissions    (docs "Last Update": February 21, 2026)
 #   - Core IAM policies and PaletteControllersEKSPolicy
@@ -69,6 +69,8 @@ TARGET_ACCOUNT_ID="${TARGET_ACCOUNT_ID:-}"
 TARGET_DEPLOYER_ROLE_NAME="${TARGET_DEPLOYER_ROLE_NAME:-$DEPLOYER_ROLE_NAME}"
 TARGET_HUBBLE_ROLE_NAME="${TARGET_HUBBLE_ROLE_NAME:-$HUBBLE_ROLE_NAME}"
 TARGET_AWS_PROFILE="${TARGET_AWS_PROFILE:-}"
+STS_TRUSTED_ACCOUNT_ID="${STS_TRUSTED_ACCOUNT_ID:-}"
+STS_CALLER_PROFILE="${STS_CALLER_PROFILE:-}"
 STS_EXTERNAL_ID="${STS_EXTERNAL_ID:-}"
 STS_SESSION_TAGS="${STS_SESSION_TAGS:-false}"
 
@@ -255,8 +257,16 @@ if [[ "$POD_IDENTITY_CROSS_ACCOUNT" == true ]]; then
         "Point TARGET_AWS_PROFILE at credentials for account $TARGET_ACCOUNT_ID, or clear it to skip target-account checks."
     fi
   fi
+elif [[ "$AUTH_MODE" == "sts" && -n "$TARGET_ACCOUNT_ID" && -n "$TARGET_AWS_PROFILE" ]]; then
+  TARGET_CALLER_ACCOUNT=$(aws_as "$TARGET_AWS_PROFILE" sts get-caller-identity --query Account --output text 2>"$ERR_FILE" || true)
+  if [[ "$TARGET_CALLER_ACCOUNT" == "$TARGET_ACCOUNT_ID" ]]; then
+    TARGET_PROFILE_OK=true
+  else
+    fail "TARGET_AWS_PROFILE '$TARGET_AWS_PROFILE' resolves to account '${TARGET_CALLER_ACCOUNT:-$(last_error)}', not $TARGET_ACCOUNT_ID" \
+      "Point TARGET_AWS_PROFILE at credentials for account $TARGET_ACCOUNT_ID, or clear it."
+  fi
 elif [[ -n "$TARGET_AWS_PROFILE" ]]; then
-  info "TARGET_AWS_PROFILE is used only for Pod Identity cross-account checks; ignoring it for auth mode '$AUTH_MODE'"
+  info "TARGET_AWS_PROFILE is used only with TARGET_ACCOUNT_ID in sts or pod-identity mode; ignoring it"
 fi
 
 # Profile used by the simulation helpers. Sections that inspect target-account
@@ -863,6 +873,10 @@ fi
 # ─── Section 5: STS Validation ────────────────────────────────────────────────
 header "Section 5: STS Validation"
 
+# Profile whose credentials request the live assume-role. Palette assumes the
+# role from the AWS account configured for STS on the Palette/VerteX instance.
+STS_CALLER="${STS_CALLER_PROFILE:-$AWS_PROFILE}"
+
 # Usage: try_assume_role <role-arn>
 try_assume_role() {
   local role_arn="$1"
@@ -884,10 +898,10 @@ try_assume_role() {
   fi
 
   local key
-  if key=$(aws sts assume-role "${args[@]}" 2>"$ERR_FILE") && [[ -n "$key" && "$key" != "None" ]]; then
+  if key=$(aws_as "$STS_CALLER" sts assume-role "${args[@]}" 2>"$ERR_FILE") && [[ -n "$key" && "$key" != "None" ]]; then
     pass "$description into '$role_arn' succeeded (session key: ${key:0:8}...)"
   else
-    local fix="Run this check with credentials for the AWS account configured for STS on your Palette/VerteX instance; the role trust policy must trust that account. The Spectro Cloud docs require an external ID: set STS_EXTERNAL_ID to the External ID shown in the Palette Add AWS Account wizard. Inspect the trust policy with: aws iam get-role --role-name '${role_arn##*/}'"
+    local fix="The role trust policy must trust the AWS account configured for STS on your Palette/VerteX instance (set STS_TRUSTED_ACCOUNT_ID to check it directly), and the caller must be in that account (STS_CALLER_PROFILE). The Spectro Cloud docs require an external ID: set STS_EXTERNAL_ID to the External ID shown in the Palette Add AWS Account wizard. Inspect the trust policy with: aws iam get-role --role-name '${role_arn##*/}'"
     if [[ "$STS_SESSION_TAGS" == "true" ]]; then
       fix="$fix. STS_SESSION_TAGS=true also requires sts:TagSession for the caller in the trust policy and the caller's own policies."
     fi
@@ -896,13 +910,88 @@ try_assume_role() {
   return 0
 }
 
-if [[ "$AUTH_MODE" == "sts" ]]; then
-  info "Run this mode with credentials for the AWS account configured for STS on your Palette/VerteX instance."
+# Reads the role's trust policy and checks that it trusts the Palette STS
+# account with the tenant External ID. Works without credentials for that
+# account, which Palette SaaS users do not have.
+# Usage: validate_sts_trust <role-name> <profile>
+validate_sts_trust() {
+  local role_name="$1" profile="$2" trust_doc
+  trust_doc=$(aws_as "$profile" iam get-role --role-name "$role_name" \
+    --query 'Role.AssumeRolePolicyDocument' --output json 2>/dev/null || echo "null")
+  if [[ "$trust_doc" == "null" ]]; then
+    fail "Role '$role_name' not found — cannot check its STS trust policy" \
+      "Create it with ./setup-iam.sh sts --apply, or as the Spectro Cloud Add AWS Account (STS) guide describes."
+    return 0
+  fi
+  local prefix="${ARN_PREFIX}:iam::${STS_TRUSTED_ACCOUNT_ID}:"
+  local jq_sts="$JQ_TRUST_DEFS"'
+    def sts_principal: ([.Principal.AWS? // empty] | flatten | map(select(startswith($prefix) or . == $acct)) | length) > 0;
+    [statements[] | select(.Effect == "Allow" and sts_principal)]'
+  local has_assume has_tag external_ids
+  has_assume=$(echo "$trust_doc" | jq -r --arg prefix "$prefix" --arg acct "$STS_TRUSTED_ACCOUNT_ID" "$jq_sts"' | map(select(has_action("sts:AssumeRole"))) | length > 0')
+  has_tag=$(echo "$trust_doc" | jq -r --arg prefix "$prefix" --arg acct "$STS_TRUSTED_ACCOUNT_ID" "$jq_sts"' | map(select(has_action("sts:TagSession"))) | length > 0')
+  external_ids=$(echo "$trust_doc" | jq -r --arg prefix "$prefix" --arg acct "$STS_TRUSTED_ACCOUNT_ID" "$jq_sts"'
+    | map(select(has_action("sts:AssumeRole")) | (.Condition? // {}) | .[]? | .["sts:ExternalId"]? // empty) | flatten | .[]')
+
+  if [[ "$has_assume" != "true" ]]; then
+    fail "'$role_name' trust policy does not allow account $STS_TRUSTED_ACCOUNT_ID to sts:AssumeRole" \
+      "Add a statement allowing Principal AWS '${ARN_PREFIX}:iam::${STS_TRUSTED_ACCOUNT_ID}:root' to sts:AssumeRole with sts:ExternalId set to the tenant External ID, or run ./setup-iam.sh sts --apply."
+    return 0
+  fi
+  pass "'$role_name' trust policy allows account $STS_TRUSTED_ACCOUNT_ID to sts:AssumeRole"
+
+  if [[ -z "$external_ids" ]]; then
+    warn "'$role_name' trust policy has no sts:ExternalId condition. The Spectro Cloud docs require the tenant External ID."
+  elif [[ -z "$STS_EXTERNAL_ID" ]]; then
+    info "'$role_name' trust policy requires an External ID; set STS_EXTERNAL_ID to compare it"
+  elif grep -qxF -- "$STS_EXTERNAL_ID" <<< "$external_ids"; then
+    pass "'$role_name' trust policy requires the configured External ID"
+  else
+    fail "'$role_name' trust policy requires a different External ID than STS_EXTERNAL_ID" \
+      "Set the sts:ExternalId condition to the External ID shown in the Palette Add AWS Account wizard for your tenant, or correct STS_EXTERNAL_ID."
+  fi
+
+  if [[ "$STS_SESSION_TAGS" == "true" ]]; then
+    if [[ "$has_tag" == "true" ]]; then
+      pass "'$role_name' trust policy allows account $STS_TRUSTED_ACCOUNT_ID to sts:TagSession"
+    else
+      fail "'$role_name' trust policy does not allow account $STS_TRUSTED_ACCOUNT_ID to sts:TagSession (STS_SESSION_TAGS=true)" \
+        "Allow sts:TagSession for '${ARN_PREFIX}:iam::${STS_TRUSTED_ACCOUNT_ID}:root' in the trust policy, or set STS_SESSION_TAGS=false."
+    fi
+  fi
+  return 0
+}
+
+# Usage: sts_checks <role-name> <role-arn> <profile-for-the-role's-account-or-empty>
+sts_checks() {
+  local role_name="$1" role_arn="$2" role_profile="$3" caller_account
+  if [[ -n "$STS_TRUSTED_ACCOUNT_ID" && -n "$role_profile" ]]; then
+    info "Checking that '$role_name' trusts the Palette STS account $STS_TRUSTED_ACCOUNT_ID..."
+    validate_sts_trust "$role_name" "$role_profile"
+  fi
+  caller_account=$(aws_as "$STS_CALLER" sts get-caller-identity --query Account --output text 2>"$ERR_FILE" || true)
+  if [[ -n "$STS_TRUSTED_ACCOUNT_ID" && "$caller_account" != "$STS_TRUSTED_ACCOUNT_ID" ]]; then
+    if [[ -n "$STS_CALLER_PROFILE" ]]; then
+      fail "STS_CALLER_PROFILE '$STS_CALLER_PROFILE' is account '${caller_account:-$(last_error)}', not the Palette STS account $STS_TRUSTED_ACCOUNT_ID" \
+        "Point STS_CALLER_PROFILE at credentials in account $STS_TRUSTED_ACCOUNT_ID, or clear it to skip the live test."
+    else
+      info "Skipping the live assume-role test: profile '$AWS_PROFILE' is account ${caller_account:-unknown}, not the Palette STS account $STS_TRUSTED_ACCOUNT_ID. Set STS_CALLER_PROFILE to a profile in that account to run it."
+    fi
+    return 0
+  fi
   if [[ -z "$STS_EXTERNAL_ID" ]]; then
     warn "STS_EXTERNAL_ID is empty. Roles created as the Spectro Cloud docs describe require the tenant's External ID, so this check will fail without it."
   fi
-  info "Attempting sts:AssumeRole into $DEPLOYER_ROLE_NAME..."
-  try_assume_role "$DEPLOYER_ROLE_ARN"
+  info "Attempting sts:AssumeRole into ${role_arn} as profile '$STS_CALLER'..."
+  try_assume_role "$role_arn"
+  return 0
+}
+
+if [[ "$AUTH_MODE" == "sts" ]]; then
+  if [[ -z "$STS_TRUSTED_ACCOUNT_ID" ]]; then
+    info "Set STS_TRUSTED_ACCOUNT_ID (the account shown in the Palette Add AWS Account wizard) to also check the role's trust policy directly"
+  fi
+  sts_checks "$DEPLOYER_ROLE_NAME" "$DEPLOYER_ROLE_ARN" "$AWS_PROFILE"
 else
   info "Skipped for auth mode '$AUTH_MODE'; direct role assumption is only required for STS authentication"
 fi
@@ -966,31 +1055,55 @@ else
       warn "eks-pod-identity-agent addon status: $ADDON_STATUS"
     fi
 
-    # 6d. Pod Identity associations exist for required service accounts
+    # 6d. Pod Identity associations exist for required service accounts. The
+    # list call omits roleArn, so each association is described individually.
     info "Checking Pod Identity associations on cluster '$CLUSTER_NAME'..."
-    ASSOCIATIONS=$(aws eks list-pod-identity-associations \
-      --cluster-name "$CLUSTER_NAME" \
-      --query 'associations[].{NS:namespace,SA:serviceAccount,Role:roleArn}' \
-      --output json 2>/dev/null || echo "[]")
 
     check_association() {
-      local ns="$1" sa="$2" label="$3" expected_role_arn="$4"
-      local found
-      found=$(echo "$ASSOCIATIONS" | jq -r \
-        --arg ns "$ns" --arg sa "$sa" \
-        '.[] | select(.NS==$ns and .SA==$sa) | .Role' 2>/dev/null | head -1)
-      if [[ -z "$found" ]]; then
-        fail "Pod Identity association MISSING: $label ($ns/$sa)" \
-          "Create it with: aws eks create-pod-identity-association --cluster-name '$CLUSTER_NAME' --namespace '$ns' --service-account '$sa' --role-arn '$expected_role_arn' --profile '$AWS_PROFILE'"
-      elif [[ "$found" == "$expected_role_arn" ]]; then
+      local ns="$1" sa="$2" label="$3" expected_role_arn="$4" expected_target="${5:-}"
+      local id details found target create_fix
+      create_fix="Create it with: aws eks create-pod-identity-association --cluster-name '$CLUSTER_NAME' --namespace '$ns' --service-account '$sa' --role-arn '$expected_role_arn'"
+      if [[ -n "$expected_target" ]]; then
+        create_fix="$create_fix --target-role-arn '$expected_target'"
+      fi
+      create_fix="$create_fix --profile '$AWS_PROFILE' (or run ./setup-iam.sh pod-identity --apply)"
+      id=$(aws eks list-pod-identity-associations --cluster-name "$CLUSTER_NAME" \
+        --namespace "$ns" --service-account "$sa" \
+        --query 'associations[0].associationId' --output text 2>/dev/null || echo "None")
+      if [[ -z "$id" || "$id" == "None" ]]; then
+        fail "Pod Identity association MISSING: $label ($ns/$sa)" "$create_fix"
+        return 0
+      fi
+      details=$(aws eks describe-pod-identity-association --cluster-name "$CLUSTER_NAME" \
+        --association-id "$id" --query 'association.[roleArn,targetRoleArn]' --output text 2>/dev/null || true)
+      found=$(cut -f1 <<< "$details")
+      target=$(cut -f2 <<< "$details")
+      if [[ "$target" == "None" ]]; then target=""; fi
+      if [[ -z "$found" || "$found" == "None" ]]; then
+        warn "Pod Identity association $label ($ns/$sa) exists, but its role could not be read (association $id)"
+        return 0
+      fi
+      if [[ "$found" == "$expected_role_arn" ]]; then
         pass "Pod Identity association found: $label ($ns/$sa → $found)"
       else
         warn "Pod Identity association $label ($ns/$sa) uses '$found', not the configured '$expected_role_arn' — verify this is intentional"
       fi
+      if [[ -n "$expected_target" ]]; then
+        if [[ "$target" == "$expected_target" ]]; then
+          pass "Pod Identity association $label uses target role $target"
+        else
+          fail "Pod Identity association $label ($ns/$sa) has target role '${target:-none}', expected '$expected_target'" \
+            "Update it with: aws eks update-pod-identity-association --cluster-name '$CLUSTER_NAME' --association-id '$id' --role-arn '$expected_role_arn' --target-role-arn '$expected_target' --profile '$AWS_PROFILE'"
+        fi
+      fi
       return 0
     }
 
-    check_association "hubble-system" "spectro-hubble" "spectro-hubble" "$HUBBLE_ROLE_ARN"
+    if [[ "$POD_IDENTITY_CROSS_ACCOUNT" == true ]]; then
+      check_association "hubble-system" "spectro-hubble" "spectro-hubble" "$HUBBLE_ROLE_ARN" "$TARGET_HUBBLE_ARN"
+    else
+      check_association "hubble-system" "spectro-hubble" "spectro-hubble" "$HUBBLE_ROLE_ARN"
+    fi
     check_association "palette-identity" "palette-identity" "palette-identity" "$IDENTITY_ROLE_ARN"
   else
     info "Skipping Pod Identity version, addon, and association checks for auth mode '$AUTH_MODE'"
@@ -1212,8 +1325,11 @@ elif [[ -z "$TARGET_ACCOUNT_ID" ]]; then
   warn "TARGET_ACCOUNT_ID not set — skipping cross-account checks"
   warn "  Set TARGET_ACCOUNT_ID=<account-id> to validate cross-account role assumption"
 elif [[ "$AUTH_MODE" == "sts" ]]; then
-  info "Attempting cross-account sts:AssumeRole into: $TARGET_DEPLOYER_ARN"
-  try_assume_role "$TARGET_DEPLOYER_ARN"
+  STS_TARGET_PROFILE=""
+  if [[ "$TARGET_PROFILE_OK" == true ]]; then
+    STS_TARGET_PROFILE="$TARGET_AWS_PROFILE"
+  fi
+  sts_checks "$TARGET_DEPLOYER_ROLE_NAME" "$TARGET_DEPLOYER_ARN" "$STS_TARGET_PROFILE"
 else
   info "Validating Pod Identity cross-account roles (management account $ACCOUNT_ID → target account $TARGET_ACCOUNT_ID)..."
 

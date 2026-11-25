@@ -2,7 +2,7 @@
 """Offline tests for validate-iam.sh and the policy renderers.
 
 Each scenario builds a fake AWS environment whose IAM roles carry the policies
-published in the Spectro Cloud docs (tests/fixtures/docs), runs validate-iam.sh
+published in the Spectro Cloud docs (policies/spectro-docs), runs validate-iam.sh
 under /bin/bash against the mock aws and kubectl in tests/mock, and checks the
 exit status and number of failed checks.
 
@@ -24,7 +24,7 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent
-DOCS = HERE / "fixtures" / "docs"
+DOCS = REPO / "policies" / "spectro-docs"
 REGRESSION = HERE / "fixtures" / "regression"
 MOCK_BIN = HERE / "mock"
 BASH = "/bin/bash" if os.path.exists("/bin/bash") else shutil.which("bash")
@@ -93,6 +93,12 @@ def arn(account, name, partition="aws"):
     return f"arn:{partition}:iam::{account}:role/{name}"
 
 
+def sts_trust(trusted_account, external_id, partition="aws"):
+    return {"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:{partition}:iam::{trusted_account}:root"}, "Action": "sts:AssumeRole",
+        "Condition": {"StringEquals": {"sts:ExternalId": external_id}}}]}
+
+
 def pod_env():
     return ["AWS_REGION", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"]
 
@@ -112,18 +118,19 @@ class Scenario:
             "partition": partition,
             "profiles": {"mock": {"account": A, "arn": f"arn:{partition}:iam::{A}:user/validator", "region": region}},
             "principals": {},
-            "assume": {},
             "oidc_providers": [],
             "cluster": {
                 "name": CLUSTER, "status": "ACTIVE", "version": "1.31",
                 "issuer": f"https://oidc.eks.{region}.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE",
                 "addons": {"eks-pod-identity-agent": "ACTIVE"},
+                "endpoint": f"https://EXAMPLE0123.gr7.{region}.eks.amazonaws.com",
                 "associations": [
                     {"NS": "hubble-system", "SA": "spectro-hubble", "Role": arn(A, HUBBLE, partition)},
                     {"NS": "palette-identity", "SA": "palette-identity", "Role": arn(A, IDENTITY, partition)},
                 ],
             },
             "k8s": {
+                "server": f"https://EXAMPLE0123.gr7.{region}.eks.amazonaws.com",
                 "managementClusterName": CLUSTER,
                 "pods": {
                     "hubble-system": {"name": "spectro-hubble-7d9c", "env": pod_env()},
@@ -135,6 +142,7 @@ class Scenario:
             "AWS_PROFILE": "mock", "PARTITION": partition, "AUTH_MODE": auth, "CLUSTER_NAME": CLUSTER,
             "ACCOUNT_ID": "", "DEPLOYER_ROLE_NAME": PALETTE, "HUBBLE_ROLE_NAME": HUBBLE,
             "IDENTITY_ROLE_NAME": IDENTITY, "PERMISSION_PROFILE": profile, "PLACEMENT_MODE": placement,
+            "STS_TRUSTED_ACCOUNT_ID": "", "STS_CALLER_PROFILE": "",
             "STS_EXTERNAL_ID": "", "STS_SESSION_TAGS": "false", "TARGET_ACCOUNT_ID": "",
             "TARGET_DEPLOYER_ROLE_NAME": "", "TARGET_HUBBLE_ROLE_NAME": "", "TARGET_AWS_PROFILE": "",
         }
@@ -145,11 +153,11 @@ class Scenario:
             palette_policies.append(fixture(POD_IDENTITY_SUPPLEMENT[profile]))
         if auth == "secret":
             self.state["principals"][f"arn:{partition}:iam::{A}:user/validator"] = {"policies": palette_policies}
+        elif auth == "sts":
+            self.role(A, PALETTE, sts_trust(A, EXTERNAL_ID, partition), palette_policies)
+            self.conf["STS_EXTERNAL_ID"] = EXTERNAL_ID
         else:
             self.role(A, PALETTE, self.trust, palette_policies)
-        if auth == "sts":
-            self.state["assume"][arn(A, PALETTE, partition)] = {"trusted_accounts": [A], "external_id": EXTERNAL_ID}
-            self.conf["STS_EXTERNAL_ID"] = EXTERNAL_ID
         self.role(A, HUBBLE, self.trust, [fixture("hubble-permissions")])
         self.role(A, IDENTITY, self.trust, [fixture("identity-permissions", self.subs)])
         for capa in CAPA_ROLES:
@@ -160,6 +168,12 @@ class Scenario:
 
     def drop_role(self, account, name):
         self.state["principals"].pop(arn(account, name, self.partition), None)
+
+    def empty(self):
+        """An account with no roles or associations yet, for setup-iam.sh."""
+        self.state["principals"] = {}
+        self.state["cluster"]["associations"] = []
+        return self
 
     def make_cross_account(self, profile="minimum-dynamic", target_profile=True, hubble_local=HUBBLE_LOCAL_DOCS):
         """Rebuild roles to match the docs' Pod Identity cross-account model."""
@@ -175,7 +189,8 @@ class Scenario:
                   [fixture(n) for n in PROFILE_POLICIES[profile]] + [fixture(POD_IDENTITY_SUPPLEMENT[profile])])
         self.role(T, HUBBLE_TARGET, fixture("hubble-target-trust", self.subs), [fixture("hubble-target-permissions")])
         self.state["cluster"]["associations"] = [
-            {"NS": "hubble-system", "SA": "spectro-hubble", "Role": arn(A, hubble_local, self.partition)},
+            {"NS": "hubble-system", "SA": "spectro-hubble", "Role": arn(A, hubble_local, self.partition),
+             "TargetRole": arn(T, HUBBLE_TARGET, self.partition)},
             {"NS": "palette-identity", "SA": "palette-identity", "Role": arn(A, IDENTITY_LOCAL, self.partition)},
         ]
         self.state["profiles"]["target"] = {"account": T, "arn": f"arn:{self.partition}:iam::{T}:user/validator", "region": self.region}
@@ -192,9 +207,10 @@ def write_conf(path, conf):
     path.write_text("\n".join(lines) + "\n")
 
 
-def run_script(script, scenario, tmp, args=()):
+def run_script(script, scenario, tmp, args=(), write_state=True):
     state_file, conf_file, log_file = tmp / "state.json", tmp / "validate-iam.conf", tmp / "calls.log"
-    state_file.write_text(json.dumps(scenario.state))
+    if write_state:
+        state_file.write_text(json.dumps(scenario.state))
     write_conf(conf_file, scenario.conf)
     log_file.write_text("")
     path = [str(MOCK_BIN)]
@@ -262,11 +278,8 @@ class Runner:
         self.verbose, self.only = verbose, only
         self.results = []
 
-    def case(self, title, scenario, rc=0, fails=0, args=(), contains=(), absent=(), coverage=(), script="validate-iam.sh"):
-        if self.only and self.only not in title:
-            return
-        with tempfile.TemporaryDirectory() as tmp:
-            code, output, calls = run_script(script, scenario, pathlib.Path(tmp), args)
+    @staticmethod
+    def check(code, output, calls, rc=0, fails=0, contains=(), absent=(), coverage=()):
         fail_count = output.count("[FAIL]")
         problems = []
         if code != rc:
@@ -284,7 +297,37 @@ class Runner:
                 problems.append(f"not checked by validate-iam.sh ({policy_name} on {principal.split('/')[-1]}): {item}")
         if "unbound variable" in output:
             problems.append("bash reported an unbound variable")
-        self.report(title, problems, output)
+        return problems
+
+    def case(self, title, scenario, rc=0, fails=0, args=(), contains=(), absent=(), coverage=(), script="validate-iam.sh"):
+        if self.only and self.only not in title:
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            code, output, calls = run_script(script, scenario, pathlib.Path(tmp), args)
+        self.report(title, self.check(code, output, calls, rc, fails, contains, absent, coverage), output)
+
+    def flow(self, title, scenario, steps, state_check=None):
+        """Runs several scripts in turn against one fake environment.
+
+        Each step is a dict with "script" and "args" plus any check() keyword.
+        state_check(initial_state, final_state) returns a list of problems.
+        """
+        if self.only and self.only not in title:
+            return
+        problems, outputs = [], []
+        initial = json.loads(json.dumps(scenario.state))
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            for i, step in enumerate(steps):
+                step = dict(step)
+                script, args = step.pop("script"), step.pop("args", ())
+                code, output, calls = run_script(script, scenario, tmp, args, write_state=(i == 0))
+                label = f"{script} {' '.join(args)}".strip()
+                outputs.append(f"----- {label}\n{output}")
+                problems += [f"[{label}] {p}" for p in self.check(code, output, calls, **step)]
+            if state_check:
+                problems += state_check(initial, json.loads((tmp / "state.json").read_text()))
+        self.report(title, problems, "\n".join(outputs))
 
     def report(self, title, problems, output=""):
         self.results.append((title, problems))
@@ -429,6 +472,139 @@ def main():
     r.case("a missing Palette role fails once instead of cascading", s, rc=1, fails=2,
            contains=["IAM role 'SpectroCloudPaletteRole' not found"])
     r.case("rejects two positional arguments", Scenario("args"), rc=2, fails=0, args=("sts", "secret"))
+
+    # ── validate-iam.sh STS trust checks ──
+    s = Scenario("sts wrong id", auth="sts")
+    s.conf.update(STS_TRUSTED_ACCOUNT_ID=A, STS_EXTERNAL_ID="some-other-id")
+    r.case("sts mode flags a trust policy that requires a different External ID", s, rc=1, fails=2,
+           contains=["requires a different External ID"])
+
+    # ── setup-iam.sh: plan, apply, then validate ──
+    def unchanged(initial, final):
+        return [] if initial == final else ["the plan changed the environment"]
+
+    r.flow("setup-iam.sh without --apply only prints the plan and changes nothing", Scenario("plan").empty(),
+           [dict(script="setup-iam.sh", contains=["[PLAN] Create role SpectroCloudPaletteRole in account 111122223333",
+                                                  "[PLAN] Create managed policy PaletteMinimumEKSDynamicPolicy",
+                                                  "[PLAN] Create Pod Identity association hubble-system/spectro-hubble",
+                                                  "change(s) planned"])],
+           state_check=unchanged)
+
+    for profile, placement in (("minimum-dynamic", "dynamic"), ("minimum-static", "static"),
+                               ("core", "dynamic"), ("core", "static")):
+        r.flow(f"setup-iam.sh pod-identity ({profile}, {placement}) on an empty account, then validation passes; a second run changes nothing",
+               Scenario(f"setup {profile}", profile=profile, placement=placement).empty(),
+               [dict(script="setup-iam.sh", args=("--apply",), contains=["change(s) made"]),
+                dict(script="validate-iam.sh"),
+                dict(script="setup-iam.sh", args=("--apply",), contains=["Nothing to change"], absent=["[DONE]"])])
+
+    s = Scenario("setup manual cfn").empty()
+    s.conf["CFN_STACK_MODE"] = "manual"
+    r.flow("setup-iam.sh with CFN_STACK_MODE=manual creates the CAPA stack from the docs template", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["CloudFormation stack cluster-api-provider-aws-sigs-k8s-io created"],
+                 absent=["PaletteCloudFormationStackPolicy"]),
+            dict(script="validate-iam.sh", contains=["CAPA role exists: nodes.cluster-api-provider-aws.sigs.k8s.io"])])
+
+    s = Scenario("setup gov", partition="aws-us-gov", region="us-gov-west-1").empty()
+    s.conf["CFN_STACK_MODE"] = "manual"
+    r.flow("setup-iam.sh in GovCloud rewrites the docs' arn:aws: ARNs in policies and the CFN template; validation passes", s,
+           [dict(script="setup-iam.sh", args=("--apply",)), dict(script="validate-iam.sh")])
+
+    # STS
+    s = Scenario("setup sts", auth="sts").empty()
+    s.conf["STS_TRUSTED_ACCOUNT_ID"] = A
+    r.flow("setup-iam.sh sts creates a role trusting the Palette STS account with the External ID; validation assumes it", s,
+           [dict(script="setup-iam.sh", args=("--apply",)),
+            dict(script="validate-iam.sh", contains=["trust policy requires the configured External ID",
+                                                     "sts:AssumeRole with external ID into"])])
+    s = Scenario("setup sts other account", auth="sts").empty()
+    s.conf["STS_TRUSTED_ACCOUNT_ID"] = "999988887777"
+    r.flow("validate-iam.sh sts checks the trust policy directly when the Palette STS account is another account", s,
+           [dict(script="setup-iam.sh", args=("--apply",)),
+            dict(script="validate-iam.sh", contains=["allows account 999988887777 to sts:AssumeRole",
+                                                     "Skipping the live assume-role test"])])
+    s = Scenario("setup sts caller", auth="sts").empty()
+    s.conf.update(STS_TRUSTED_ACCOUNT_ID="999988887777", STS_CALLER_PROFILE="palette-sts")
+    s.state["profiles"]["palette-sts"] = {"account": "999988887777", "arn": "arn:aws:iam::999988887777:user/vertex-sts", "region": REGION}
+    r.flow("validate-iam.sh sts assumes the role from STS_CALLER_PROFILE (the Palette STS account)", s,
+           [dict(script="setup-iam.sh", args=("--apply",)),
+            dict(script="validate-iam.sh", contains=["as profile 'palette-sts'", "with external ID into"])])
+    r.case("setup-iam.sh sts refuses to run without STS_TRUSTED_ACCOUNT_ID", Scenario("sts missing", auth="sts").empty(),
+           rc=1, script="setup-iam.sh", contains=["STS mode needs STS_TRUSTED_ACCOUNT_ID"])
+    r.case("setup-iam.sh refuses secret mode", Scenario("secret setup", auth="secret"),
+           rc=1, script="setup-iam.sh", contains=["Secret mode uses an IAM user"])
+
+    # Cross-account Pod Identity
+    s = Scenario("setup cross").make_cross_account(hubble_local=HUBBLE_LOCAL_TABLE).empty()
+    r.flow("setup-iam.sh cross-account Pod Identity builds the docs' local and target roles; validation passes; a second run changes nothing", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["set to trust SpectroCloudHubbleLocalRole instead"]),
+            dict(script="validate-iam.sh", contains=["uses target role arn:aws:iam::444455556666:role/SpectroCloudHubbleTargetRole"]),
+            dict(script="setup-iam.sh", args=("--apply",), contains=["Nothing to change"])])
+
+    # Safety: existing trust statements, policies it did not create, version limit
+    s = Scenario("setup keep trust").empty()
+    s.role(A, PALETTE, {"Version": "2012-10-17", "Statement": [
+        {"Sid": "CustomerBreakGlass", "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{A}:role/BreakGlass"}, "Action": "sts:AssumeRole"}]}, [])
+
+    def kept(initial, final):
+        sids = [st.get("Sid") for st in final["principals"][arn(A, PALETTE)]["trust"]["Statement"]]
+        return [] if {"CustomerBreakGlass", "AllowEksAuthToAssumeRoleForPodIdentity"} <= set(sids) else [f"trust Sids after setup: {sids}"]
+    r.flow("setup-iam.sh adds trust statements to an existing role without removing others", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["Update the trust policy of role SpectroCloudPaletteRole"]),
+            dict(script="validate-iam.sh")], state_check=kept)
+
+    policy_arn = f"arn:aws:iam::{A}:policy/PaletteMinimumEKSDynamicPolicy"
+    old_doc = fixture("eks-dynamic-permissions-2026-02-21", directory=REGRESSION)
+    s = Scenario("setup unmanaged").empty()
+    s.state["managed_policies"] = {policy_arn: {"versions": [{"id": "v1", "doc": old_doc, "created": 1}],
+                                                "default": "v1", "tags": {}, "next": 2}}
+
+    def untouched(initial, final):
+        same = final["managed_policies"][policy_arn] == initial["managed_policies"][policy_arn]
+        return [] if same else ["setup modified a policy it did not create"]
+    r.flow("setup-iam.sh leaves a same-named policy it did not create unchanged; validation shows what it lacks", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["was not created by setup-iam.sh",
+                                                                    "actions missing: autoscaling:CancelInstanceRefresh"]),
+            # 36 gaps in the old policy; the CloudFormation stack policy setup attaches grants
+            # iam:CreateRole, GetRole, TagRole, and others on "*", which covers 16 of them.
+            dict(script="validate-iam.sh", rc=1, fails=20)], state_check=untouched)
+
+    s = Scenario("setup versions").empty()
+    s.state["managed_policies"] = {policy_arn: {"versions": [{"id": f"v{i}", "doc": old_doc, "created": i} for i in range(1, 6)],
+                                                "default": "v5", "tags": {"ManagedBy": "iam-validation-setup"}, "next": 6}}
+
+    def rotated(initial, final):
+        pol = final["managed_policies"][policy_arn]
+        ids = [v["id"] for v in pol["versions"]]
+        problems = [] if ids == ["v2", "v3", "v4", "v5", "v6"] and pol["default"] == "v6" else [f"versions {ids}, default {pol['default']}"]
+        if next(v["doc"] for v in pol["versions"] if v["id"] == pol["default"]) != fixture("eks-dynamic-permissions"):
+            problems.append("the default version is not the docs policy")
+        return problems
+    r.flow("setup-iam.sh updates its own policy to the docs version, removing the oldest version at the 5-version limit", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["Delete version v1", "Update managed policy PaletteMinimumEKSDynamicPolicy"]),
+            dict(script="validate-iam.sh")], state_check=rotated)
+
+    # Cluster prerequisites and associations
+    s = Scenario("setup prereqs").empty()
+    s.conf["SETUP_CLUSTER_PREREQS"] = "true"
+    s.state["cluster"]["addons"] = {}
+    del s.state["k8s"]["managementClusterName"]
+    r.flow("setup-iam.sh with SETUP_CLUSTER_PREREQS installs the agent add-on and palette-global-config", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["Install the eks-pod-identity-agent add-on",
+                                                                    "Create ConfigMap kube-system/palette-global-config"]),
+            dict(script="validate-iam.sh")])
+    s = Scenario("setup wrong context").empty()
+    s.conf["SETUP_CLUSTER_PREREQS"] = "true"
+    del s.state["k8s"]["managementClusterName"]
+    s.state["k8s"]["server"] = "https://some-other-cluster.example.com"
+    r.flow("setup-iam.sh does not touch Kubernetes when kubectl points at another cluster", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["does not point at cluster mgmt-eks"]),
+            dict(script="validate-iam.sh", rc=1, fails=1, contains=["palette-global-config' in kube-system is missing"])])
+    s = Scenario("setup assoc").empty()
+    s.state["cluster"]["associations"] = [{"NS": "hubble-system", "SA": "spectro-hubble", "Role": arn(A, "SomeOtherRole")}]
+    r.flow("setup-iam.sh repoints an existing association at the configured role", s,
+           [dict(script="setup-iam.sh", args=("--apply",), contains=["Update Pod Identity association hubble-system/spectro-hubble (was SomeOtherRole)"]),
+            dict(script="validate-iam.sh", absent=["SomeOtherRole"])])
 
     # ── Renderers ──
     for script, expect in (("render-capa-policy.sh", f"arn:aws-us-gov:iam::{A}:role/*.cluster-api-provider-aws.sigs.k8s.io"),
