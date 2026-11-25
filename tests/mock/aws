@@ -51,7 +51,14 @@ def as_list(value):
     return value if isinstance(value, list) else [value]
 
 
+# Actions without resource-level permissions. Like IAM, the mock authorizes
+# them only against the "*" resource.
+NO_RESOURCE_LEVEL = {"eks:createcluster"}
+
+
 def evaluate(policies, action, resource):
+    if action.lower() in NO_RESOURCE_LEVEL and resource != "*":
+        return "implicitDeny"
     decision = "implicitDeny"
     for policy in policies:
         for st in as_list(policy.get("Statement")):

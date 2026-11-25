@@ -552,6 +552,12 @@ When Spectro Cloud updates its IAM documentation:
   copied the minimum EKS policies verbatim: their
   `IAMOpenIDConnectProviderPermissions` statement uses
   `arn:aws:iam::*:oidc-provider/*`. Change it to `arn:*:iam::*:oidc-provider/*`.
+- `eks:CreateCluster` has no resource-level permissions, so IAM allows it only
+  through a statement with `"Resource": "*"`, and the validator checks it
+  against `*`. The minimum EKS policies grant it that way. The docs' core
+  PaletteControllersEKSPolicy grants it only on `arn:*:eks:*:*:cluster/*`,
+  which never allows it, so with the core policies this check fails until you
+  add a statement allowing `eks:CreateCluster` on `*`.
 - A failed STS check can originate on either side: the caller must be the
   account the role trusts, the external ID must match, and session tags need
   `sts:TagSession` in the trust policy.

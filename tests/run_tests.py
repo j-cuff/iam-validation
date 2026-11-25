@@ -343,6 +343,16 @@ def main():
     only = next((a for a in sys.argv[1:] if not a.startswith("-")), None)
     r = Runner(verbose, only)
 
+    # The docs' core policies grant eks:CreateCluster only on cluster ARNs. The action has no
+    # resource-level permissions, so IAM never allows it that way, and the validator reports it.
+    core_gap = dict(rc=1, fails=1, contains=["eks:CreateCluster  →  implicitDeny", "PaletteControllersEKSPolicy grants it only"])
+
+    def outcome(profile):
+        return "fail only the documented eks:CreateCluster gap" if profile == "core" else "pass"
+
+    def expected(profile):
+        return core_gap if profile == "core" else {}
+
     # ── Same-account Pod Identity with each documented permission profile ──
     for profile, placement in (("minimum-dynamic", "dynamic"), ("minimum-static", "static"),
                                ("core", "dynamic"), ("core", "static")):
@@ -355,8 +365,8 @@ def main():
         if profile != "core":
             name = PROFILE_POLICIES[profile][0]
             coverage.append((arn(A, PALETTE), name, fixture(name)))
-        r.case(f"docs {profile} policies ({placement} placement) pass in pod-identity mode, and every documented action is checked",
-               s, coverage=coverage)
+        r.case(f"docs {profile} policies ({placement} placement) {outcome(profile)} in pod-identity mode, and every documented action is checked",
+               s, coverage=coverage, **expected(profile))
 
     # ── The November 3, 2026 docs update ──
     s = Scenario("old dynamic", palette_policies=[fixture("eks-dynamic-permissions-2026-02-21", directory=REGRESSION)])
@@ -492,10 +502,10 @@ def main():
 
     for profile, placement in (("minimum-dynamic", "dynamic"), ("minimum-static", "static"),
                                ("core", "dynamic"), ("core", "static")):
-        r.flow(f"setup-iam.sh pod-identity ({profile}, {placement}) on an empty account, then validation passes; a second run changes nothing",
+        r.flow(f"setup-iam.sh pod-identity ({profile}, {placement}) on an empty account, then validation should {outcome(profile)}; a second run changes nothing",
                Scenario(f"setup {profile}", profile=profile, placement=placement).empty(),
                [dict(script="setup-iam.sh", args=("--apply",), contains=["change(s) made"]),
-                dict(script="validate-iam.sh"),
+                dict(script="validate-iam.sh", **expected(profile)),
                 dict(script="setup-iam.sh", args=("--apply",), contains=["Nothing to change"], absent=["[DONE]"])])
 
     s = Scenario("setup manual cfn").empty()

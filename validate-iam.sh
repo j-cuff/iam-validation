@@ -419,9 +419,10 @@ EC2_STATIC_ACTIONS=(
 
 # EKS actions are simulated against sample cluster and node group ARNs because
 # the core policies scope them to arn:*:eks:*:*:cluster/* and nodegroup/*/*/*,
-# which a literal "*" resource does not match.
+# which a literal "*" resource does not match. eks:CreateCluster is the
+# exception: it has no resource-level permissions, so IAM only authorizes it
+# against "*" and it is checked separately.
 EKS_CLUSTER_ACTIONS=(
-  "eks:CreateCluster"
   "eks:DeleteCluster"
   "eks:DescribeCluster"
   "eks:CreateNodegroup"
@@ -492,6 +493,11 @@ check_deployment_permissions() {
 
   # 2d. EKS core permissions
   info "Checking core EKS permissions (sample cluster and node group ARNs)..."
+  local create_cluster_fix="Allow eks:CreateCluster on Resource '*' for $principal: the action has no resource-level permissions, so a statement scoped to cluster ARNs cannot grant it."
+  if [[ "$PERMISSION_PROFILE" == "core" ]]; then
+    create_cluster_fix="${create_cluster_fix} The Spectro Cloud core PaletteControllersEKSPolicy grants it only on 'arn:*:eks:*:*:cluster/*', so add a statement allowing eks:CreateCluster on '*'."
+  fi
+  check_permission "$principal" "eks:CreateCluster" "*" "$create_cluster_fix"
   check_permissions_batch "$principal" "$eks_cluster_arn" "${EKS_CLUSTER_ACTIONS[@]}"
   check_permissions_batch "$principal" "$eks_nodegroup_arn" "${EKS_NODEGROUP_ACTIONS[@]}"
 
